@@ -345,11 +345,14 @@ Other failure concerns:
 
 ## Rate Limiting Algorithms
 
-After the key, placement, and storage model are clear, choose the algorithm.
+After the key, placement, and storage model are clear, choose the algorithm. The
+algorithm defines what state is stored and how the limiter decides whether the
+next request is allowed.
 
 ### Fixed Window
 
-Fixed Window allows a fixed number of requests in a fixed time period.
+Fixed Window divides time into equal windows and keeps one counter per key for
+the current window.
 
 Example:
 
@@ -358,22 +361,30 @@ Limit: 100 requests per minute
 Window: 12:00:00 to 12:00:59
 ```
 
-The counter resets when the next minute starts.
+For every request:
+
+1. Find the current window.
+2. Read the counter for `key + window`.
+3. If the counter is below the limit, increment it and allow the request.
+4. If the counter reached the limit, reject the request.
+5. When the next window starts, use a new counter.
 
 ```mermaid
-sequenceDiagram
-    participant Client
-    participant RL as Rate Limiter
-    participant App
+flowchart TD
+    A[Request] --> B[Compute current window]
+    B --> C[Read counter for key + window]
+    C --> D{Counter < limit?}
+    D -->|Yes| E[Increment counter]
+    E --> F[Allow]
+    D -->|No| G[Reject]
+    H[Window expires] --> I[New counter starts]
+```
 
-    Client->>RL: Request 1
-    RL->>App: Allow
-    Client->>RL: Request 2
-    RL->>App: Allow
-    Client->>RL: Request 100
-    RL->>App: Allow
-    Client->>RL: Request 101
-    RL-->>Client: 429 Too Many Requests
+Example state:
+
+```text
+rate_limit:user_123:12:00 -> 73
+TTL -> 60 seconds
 ```
 
 Pros:
@@ -386,6 +397,7 @@ Pros:
 Cons:
 
 - Boundary bursts are possible.
+- Less fair around window edges.
 
 Boundary burst:
 
@@ -397,9 +409,21 @@ Boundary burst:
 This is valid for fixed windows, but it allows 200 requests in a very short
 interval.
 
+Use it for simple limits where occasional edge bursts are acceptable.
+
 ### Sliding Window Log
 
-Sliding Window Log stores timestamps for recent requests.
+Sliding Window Log stores each accepted request timestamp for a key. Instead of
+using a fixed wall-clock window, it looks back over the last `N` seconds from the
+current request time.
+
+Example:
+
+```text
+Limit: 100 requests per 60 seconds
+Current time: 12:01:20
+Valid timestamps: requests after 12:00:20
+```
 
 For every request:
 
@@ -407,6 +431,22 @@ For every request:
 2. Count timestamps still inside the window.
 3. Allow only if the count is below the limit.
 4. Store the new timestamp if allowed.
+
+```mermaid
+flowchart TD
+    A[Request at time T] --> B[Load timestamp list for key]
+    B --> C[Remove timestamps older than T - window]
+    C --> D{Remaining count < limit?}
+    D -->|Yes| E[Append timestamp T]
+    E --> F[Allow]
+    D -->|No| G[Reject]
+```
+
+Example state:
+
+```text
+rate_limit:user_123 -> [12:00:22, 12:00:29, 12:00:45, 12:01:10]
+```
 
 Pros:
 
@@ -424,11 +464,42 @@ large.
 
 ### Sliding Window Counter
 
-Sliding Window Counter approximates a rolling window using the current and
-previous fixed windows.
+Sliding Window Counter is a memory-efficient approximation of a rolling window.
+It keeps counters for smaller time segments and estimates usage in the current
+rolling window.
 
-It estimates how much traffic from the previous window still overlaps with the
-current rolling window.
+One common version uses the previous and current fixed windows:
+
+```text
+estimated_count =
+    current_window_count
+    + previous_window_count * overlap_ratio
+```
+
+Example:
+
+```text
+Limit: 100 requests per minute
+Previous window count: 80
+Current window count: 30
+Current window elapsed: 15 seconds
+Previous window overlap: 45 / 60 = 0.75
+
+Estimated count = 30 + (80 * 0.75) = 90
+```
+
+```mermaid
+flowchart TD
+    A[Request] --> B[Read current window counter]
+    A --> C[Read previous window counter]
+    B --> D[Calculate overlap weight]
+    C --> D
+    D --> E[Estimate rolling count]
+    E --> F{Estimate < limit?}
+    F -->|Yes| G[Increment current counter]
+    G --> H[Allow]
+    F -->|No| I[Reject]
+```
 
 Pros:
 
@@ -446,16 +517,16 @@ request timestamp is too expensive.
 
 ### Token Bucket
 
-Token Bucket has a bucket with a maximum capacity. Tokens refill over time. Each
-request consumes one token.
+Token Bucket keeps a bucket of tokens for each key. Tokens are added at a fixed
+rate up to a maximum bucket size. Each request consumes one or more tokens.
 
 ```mermaid
 flowchart TD
     R[Refill Tokens] --> B[Token Bucket]
-    Q[Request] --> C{Token Available?}
+    Q[Request arrives] --> C{Enough tokens?}
     B --> C
-    C -->|Yes| A[Allow Request]
-    C -->|No| D[Reject or Wait]
+    C -->|Yes| A[Consume token and allow]
+    C -->|No| D[Reject or wait]
 ```
 
 Example:
@@ -467,6 +538,19 @@ Bucket size: 50 tokens
 
 This allows a short burst of up to 50 requests, while long-term traffic stays
 near 10 requests per second.
+
+For every request:
+
+1. Calculate how many tokens should have been refilled since the last update.
+2. Add those tokens, capped by bucket size.
+3. If enough tokens exist, consume tokens and allow the request.
+4. If not enough tokens exist, reject or wait.
+
+Example state:
+
+```text
+key -> tokens_available, last_refill_time
+```
 
 Pros:
 
@@ -483,15 +567,35 @@ Use it when short bursts are acceptable but sustained traffic must be controlled
 
 ### Leaky Bucket
 
-Leaky Bucket accepts requests into a queue and processes them at a fixed rate.
-If the queue is full, new requests are rejected.
+Leaky Bucket is usually explained in two ways:
+
+- **As a queue:** requests enter a queue and leave at a fixed rate.
+- **As a meter:** a counter increases when requests arrive and leaks down at a
+  fixed rate.
+
+For API design, the queue version is easiest to reason about: it smooths bursty
+input into steady output. If the queue is full, new requests are rejected.
 
 ```mermaid
 flowchart TD
-    I[Incoming Requests] --> Q[Queue]
-    Q -->|Fixed Output Rate| S[Service]
-    Q -. Full .-> R[Reject]
+    I[Bursty incoming requests] --> Q[Finite queue]
+    Q -->|Fixed drain rate| S[Downstream service]
+    Q -. Queue full .-> R[Reject]
 ```
+
+Example:
+
+```text
+Queue capacity: 100 requests
+Drain rate: 20 requests/second
+```
+
+For every request:
+
+1. If the queue has space, enqueue the request.
+2. If the queue is full, reject the request.
+3. A worker drains the queue at a fixed rate.
+4. The downstream service receives smoother traffic.
 
 Pros:
 
@@ -507,15 +611,42 @@ Cons:
 Use it when the downstream service needs a steady flow instead of bursty
 traffic.
 
+### Concurrency Limiter
+
+A Concurrency Limiter is related, but it is not a requests-per-time algorithm.
+It limits how many requests can be in progress at the same time.
+
+```mermaid
+flowchart TD
+    A[Request starts] --> B{Active requests < limit?}
+    B -->|Yes| C[Increment active count]
+    C --> D[Process request]
+    D --> E[Request completes]
+    E --> F[Decrement active count]
+    B -->|No| G[Reject or queue]
+```
+
+Example:
+
+```text
+Limit: 50 concurrent requests
+Current active requests: 50
+Next request: rejected or queued
+```
+
+Use it for expensive or slow endpoints where the main risk is too many
+in-flight operations, not too many requests over a time period.
+
 ## Algorithm Comparison
 
-| Algorithm | Accuracy | Burst Support | Memory | Main Tradeoff |
+| Algorithm | What It Stores | Accuracy | Burst Behavior | Best Use |
 | --- | --- | --- | --- | --- |
-| Fixed Window | Low near boundaries | Allows boundary bursts | Low | Simplest, but less fair |
-| Sliding Window Log | High | Controls bursts well | High | Accurate, but expensive |
-| Sliding Window Counter | Medium-high | Controls bursts reasonably | Low | Scalable approximation |
-| Token Bucket | Medium | Allows controlled bursts | Low | Great for burst-friendly APIs |
-| Leaky Bucket | Medium | Smooths bursts into steady flow | Queue size | Adds latency but protects downstream |
+| Fixed Window | Counter per key per window | Low near boundaries | Allows edge bursts | Simple limits |
+| Sliding Window Log | Timestamp list per key | High | Controls bursts well | Strict rolling limits |
+| Sliding Window Counter | Counters for current/previous segments | Medium-high | Controls bursts reasonably | Scalable API limits |
+| Token Bucket | Token count and last refill time | Medium | Allows controlled bursts | Public APIs and tiered plans |
+| Leaky Bucket | Queue or leaking counter | Medium | Smooths bursts into steady output | Protecting downstream services |
+| Concurrency Limiter | Active request count | Exact for in-flight count | Not time-based | Slow or expensive endpoints |
 
 ## When To Use Which Algorithm
 
@@ -529,6 +660,7 @@ traffic.
 | Login or password reset protection | Sliding Window Log or Sliding Window Counter | Limits abuse over a rolling period |
 | Costly third-party API calls | Token Bucket or Leaky Bucket | Controls spend and shields dependency |
 | SaaS plans with free and paid tiers | Token Bucket or Sliding Window Counter | Different plans can have different rates and burst capacity |
+| Slow report generation endpoint | Concurrency Limiter | Caps in-flight expensive work |
 
 ## Practical Examples
 
@@ -544,6 +676,21 @@ internal implementation.
 | Background jobs calling a dependency | Leaky Bucket | Prevents sudden bursts from overwhelming the dependency |
 | Free vs paid API plans | Token Bucket | Paid plans can have larger bucket size and refill rate |
 | Basic admin endpoint protection | Fixed Window | Simple limits are often enough |
+| API gateway throttling | Token Bucket | AWS API Gateway documents token bucket throttling with rate and burst settings |
+| Proxy/local rate limiting | Token Bucket | Envoy local rate limit filter uses a token bucket and can return 429 when empty |
+
+## Sources
+
+- Microsoft ASP.NET Core Rate Limiting Middleware:
+  `https://learn.microsoft.com/en-us/aspnet/core/performance/rate-limit`
+- Amazon API Gateway request throttling:
+  `https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-request-throttling.html`
+- Envoy local rate limit filter:
+  `https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/local_rate_limit_filter`
+- Token Bucket overview:
+  `https://en.wikipedia.org/wiki/Token_bucket`
+- Leaky Bucket overview:
+  `https://en.wikipedia.org/wiki/Leaky_bucket`
 
 ## Rate Limiting vs Throttling vs Quotas
 
