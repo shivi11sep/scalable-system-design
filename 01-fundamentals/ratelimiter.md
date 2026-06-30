@@ -1,60 +1,99 @@
 # Rate Limiter
 
-A rate limiter controls how many requests a client, user, IP address, API key,
-or service can make in a given amount of time.
+A rate limiter controls how many requests a client can make in a given time
+period. The client can be an IP address, user, API key, tenant, device, or
+internal service.
 
-It protects a system from overload, abuse, accidental traffic spikes, and noisy
-clients.
+In an interview, do not start with algorithms immediately. Start with the
+problem: what are we protecting, who are we limiting, where should the decision
+be made, and what should happen when the limit is exceeded.
 
-```mermaid
-flowchart LR
-    C1[Client A]
-    C2[Client B]
-    C3[Client C]
+## Interview Flow
 
-    RL[Rate Limiter]
-    APP[Application Server]
+A clean way to explain rate limiter design:
 
-    C1 --> RL
-    C2 --> RL
-    C3 --> RL
+1. Clarify requirements.
+2. Define what is being limited.
+3. Decide where the rate limiter sits.
+4. Decide the limit key.
+5. Define request behavior for allowed and rejected requests.
+6. Design the distributed architecture.
+7. Choose storage and atomic update strategy.
+8. Discuss failure handling.
+9. Compare algorithms and choose one.
+10. Discuss metrics and operational concerns.
 
-    RL -->|Allowed| APP
-    RL -. Rejected .-> R[429 Too Many Requests]
+This flow keeps the answer grounded. Algorithms come after we understand the
+system constraints.
+
+## 1. Clarify Requirements
+
+Before designing, ask what kind of limit is needed.
+
+Useful questions:
+
+- Are we limiting anonymous users, logged-in users, API keys, tenants, or
+  internal services?
+- Is the limit global across all servers or local to one server?
+- Should the system reject requests or delay them?
+- Are short bursts allowed?
+- Is strict accuracy required, or is approximate limiting acceptable?
+- What response should clients receive after crossing the limit?
+- Is this protecting an application, a database, a third-party API, login, or a
+  public API?
+
+Example requirement:
+
+```text
+Allow each API key to make 100 requests per minute.
+If the key exceeds the limit, return HTTP 429 Too Many Requests.
+The limit must work globally across all API gateway instances.
 ```
 
-## Why We Need It
+## 2. Why We Need Rate Limiting
 
-Without rate limiting, one client can consume too much capacity and affect
-everyone else.
+Without rate limiting, one client can consume too much capacity and hurt other
+users.
 
 Common problems:
 
-- A buggy client sends too many retries.
+- A buggy client retries too aggressively.
 - A user repeatedly calls an expensive endpoint.
-- A bot scrapes or abuses public APIs.
-- A sudden traffic spike overloads application servers.
+- A bot scrapes public APIs.
+- Login endpoints receive brute-force attempts.
+- A tenant in a SaaS system consumes more than its fair share.
 - Downstream services such as databases or third-party APIs get overwhelmed.
 
 A rate limiter helps with:
 
 - **Availability:** keep the system responsive during spikes.
-- **Fairness:** prevent one client from using all capacity.
-- **Cost control:** reduce unnecessary compute, database, and API usage.
-- **Abuse prevention:** slow down bots, brute-force attempts, and scraping.
-- **Backpressure:** reject or delay traffic before the whole system fails.
+- **Fairness:** prevent one client from consuming all capacity.
+- **Cost control:** reduce unnecessary compute, database, and external API usage.
+- **Abuse prevention:** slow down scraping, brute force, and spam.
+- **Backpressure:** reject traffic before the entire system fails.
 
-```mermaid
-flowchart TD
-    A[Incoming Request] --> B{Within Limit?}
-    B -->|Yes| C[Allow Request]
-    B -->|No| D[Reject or Throttle]
-    D --> E[Return 429]
-```
+## 3. What We Limit
 
-## Where Rate Limiters Sit
+The rate limiter needs a key. The key decides whose usage is counted.
 
-Rate limiting can happen at different layers.
+| Key | Example | Use When |
+| --- | --- | --- |
+| IP address | `203.0.113.10` | Anonymous traffic before login |
+| User ID | `user_123` | Logged-in product usage |
+| API key | `api_key_abc` | Developer APIs |
+| Tenant ID | `tenant_42` | SaaS customer isolation |
+| Route | `/login` | Endpoint-specific protection |
+| Service name | `payment-service` | Internal service-to-service limits |
+| Combination | `user_123:/orders` | Per-user per-endpoint limits |
+
+Choosing the key matters. IP-based limits are useful before authentication, but
+they can be unfair when many users share one NAT or office network. User ID or
+API-key limits are better after authentication. Endpoint-level limits are useful
+when one route is much more expensive than others.
+
+## 4. Where The Rate Limiter Sits
+
+Rate limiting can happen at multiple layers.
 
 ```mermaid
 flowchart LR
@@ -62,209 +101,50 @@ flowchart LR
     CDN --> LB[Load Balancer]
     LB --> GW[API Gateway]
     GW --> APP[Application]
-    APP --> SVC[Internal Service]
+    APP --> DB[(Database)]
 ```
 
 Common placements:
 
-- **CDN or edge:** block abusive traffic before it reaches your infrastructure.
-- **Load balancer:** enforce coarse limits near traffic entry.
-- **API gateway:** enforce user, API key, route, or tenant-level limits.
-- **Application:** apply business-specific rules.
-- **Internal service:** protect expensive dependencies from other services.
+| Placement | What It Protects | Notes |
+| --- | --- | --- |
+| CDN / edge | Infrastructure from obvious abusive traffic | Good for IP-level rules |
+| Load balancer | Backend fleet from coarse traffic spikes | Usually not business-aware |
+| API gateway | APIs by user, API key, route, or tenant | Common place for rate limiting |
+| Application | Business-specific limits | Knows user and domain context |
+| Internal service | Expensive downstream dependency | Protects databases, queues, third-party APIs |
 
-Production systems often use multiple rate limiters at different layers.
+In many designs, the API gateway is the best primary place because it sees all
+API traffic before it reaches application servers and can apply route/user/API
+key policies.
 
-## What To Limit By
+## 5. Request Behavior
 
-The limiter needs a key that identifies the caller or resource.
-
-Common keys:
-
-| Key | Use When |
-| --- | --- |
-| IP address | Anonymous public traffic |
-| User ID | Logged-in users |
-| API key | Public developer APIs |
-| Tenant ID | SaaS customer isolation |
-| Route/path | Expensive endpoints need stricter limits |
-| Service name | Internal service-to-service limits |
-| Combination | Example: `user_id + endpoint` |
-
-Choosing the wrong key can make limits too strict or too weak. For example, IP
-limits can unfairly group many users behind the same NAT, while user limits do
-not help before login.
-
-## Fixed Window
-
-Fixed Window allows a fixed number of requests in a fixed time period.
-
-Example:
-
-- Limit: 3 requests per second.
-- Window: `12:00:00` to `12:00:01`.
-- First 3 requests are allowed.
-- Extra requests in that same window are rejected.
-- At the next window, the counter resets.
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant RL as Rate Limiter
-    participant App
-
-    Client->>RL: Request 1
-    RL->>App: Allow
-    Client->>RL: Request 2
-    RL->>App: Allow
-    Client->>RL: Request 3
-    RL->>App: Allow
-    Client->>RL: Request 4
-    RL-->>Client: 429 Too Many Requests
-```
-
-Pros:
-
-- Very simple.
-- Easy to implement.
-- Efficient storage: one counter per key per window.
-
-Cons:
-
-- Boundary bursts are possible.
-- Traffic can be uneven around window edges.
-
-Boundary burst example:
-
-```text
-Allowed: 100 requests from 12:00:59.900 to 12:01:00.000
-Allowed: 100 requests from 12:01:00.000 to 12:01:00.100
-```
-
-Even with a limit of 100 requests per minute, the system may receive 200
-requests in a very short time around the boundary.
-
-## Token Bucket
-
-Token Bucket stores tokens in a bucket. Each request consumes one token. Tokens
-are refilled at a steady rate up to a maximum bucket size.
+For every request, the limiter decides:
 
 ```mermaid
 flowchart TD
-    R[Refill tokens over time] --> B[Token Bucket]
-    Q[Request] --> C{Token available?}
-    B --> C
-    C -->|Yes| A[Allow and remove token]
-    C -->|No| D[Reject or wait]
+    A[Incoming Request] --> B[Identify Limit Key]
+    B --> C[Find Matching Rule]
+    C --> D[Update Counter / Tokens]
+    D --> E{Within Limit?}
+    E -->|Yes| F[Forward To Service]
+    E -->|No| G[Return 429 Too Many Requests]
 ```
 
-Pros:
+When a request is allowed, it continues to the backend service.
 
-- Allows short bursts.
-- Smooths traffic over time.
-- Common for API rate limiting.
-
-Cons:
-
-- Slightly more complex than fixed window.
-- Needs careful refill calculation.
-
-Use Token Bucket when occasional bursts are acceptable but sustained traffic
-must stay within a rate.
-
-## Leaky Bucket
-
-Leaky Bucket processes requests at a steady rate. Incoming requests enter a
-queue, and the bucket leaks at a fixed speed.
-
-```mermaid
-flowchart TD
-    I[Incoming Requests] --> Q[Queue / Bucket]
-    Q -->|Fixed rate| S[Service]
-    Q -. full .-> R[Reject]
-```
-
-Pros:
-
-- Produces a steady output rate.
-- Good when downstream systems need smooth traffic.
-
-Cons:
-
-- Can add latency because requests may wait in a queue.
-- Requests are rejected when the queue is full.
-
-Use Leaky Bucket when you want strict smoothing rather than burst allowance.
-
-## Sliding Window Log
-
-Sliding Window Log stores timestamps for each request and removes timestamps
-outside the current window.
-
-Example:
-
-- Limit: 100 requests per minute.
-- Store timestamps for recent requests.
-- Count how many timestamps are within the last 60 seconds.
-- Allow only if the count is less than 100.
-
-Pros:
-
-- Accurate.
-- Avoids fixed-window boundary bursts.
-
-Cons:
-
-- More memory usage.
-- More expensive for high-cardinality traffic.
-
-Use Sliding Window Log when accuracy matters more than storage efficiency.
-
-## Sliding Window Counter
-
-Sliding Window Counter approximates a sliding window using counters from the
-current and previous windows.
-
-It estimates the request count based on how much of the previous window still
-overlaps with the current sliding window.
-
-Pros:
-
-- More accurate than fixed window.
-- More memory efficient than sliding window log.
-
-Cons:
-
-- Approximate, not exact.
-- Slightly more complex math.
-
-Use Sliding Window Counter for a good balance between accuracy and efficiency.
-
-## Algorithm Comparison
-
-| Algorithm | Accuracy | Burst Handling | Storage | Best For |
-| --- | --- | --- | --- | --- |
-| Fixed Window | Low around boundaries | Can burst at edges | Low | Simple limits |
-| Token Bucket | Medium | Allows controlled bursts | Low | Public APIs |
-| Leaky Bucket | Medium | Smooths bursts | Queue size | Protecting downstream systems |
-| Sliding Window Log | High | Good | Higher | Strict limits |
-| Sliding Window Counter | Medium-high | Good | Low | Scalable approximate limits |
-
-## Rejection Behavior
-
-When a request exceeds the limit, common behavior is to return HTTP `429 Too
-Many Requests`.
-
+When a request is rejected, HTTP APIs usually return `429 Too Many Requests`.
 Useful headers:
 
 | Header | Meaning |
 | --- | --- |
-| `Retry-After` | When the client should retry |
+| `Retry-After` | How long the client should wait before retrying |
 | `X-RateLimit-Limit` | Maximum allowed requests |
 | `X-RateLimit-Remaining` | Remaining requests in the current window |
 | `X-RateLimit-Reset` | When the limit resets |
 
-Example response:
+Example:
 
 ```text
 HTTP/1.1 429 Too Many Requests
@@ -274,70 +154,79 @@ X-RateLimit-Remaining: 0
 X-RateLimit-Reset: 1710000030
 ```
 
-## Distributed Rate Limiting
+## 6. Single-Server Design
 
-Rate limiting is harder when traffic is handled by many servers.
+For one server, rate limiting can be kept in memory.
 
-If each application server keeps its own local counter, the real global limit
-can be exceeded.
+```mermaid
+flowchart LR
+    C[Client] --> APP[Application Server]
+    APP --> M[(In-Memory Map)]
+    APP -->|Allowed| S[Handle Request]
+    APP -. Rejected .-> R[429]
+```
+
+The in-memory map can store:
+
+```text
+key -> counter, window_start_time
+```
+
+This is simple and fast, but it only works correctly when all traffic for a key
+goes to the same server. In a real distributed system, traffic is spread across
+many instances, so local counters are usually not enough.
+
+## 7. Distributed System Design
+
+In a distributed system, multiple gateway or application instances process
+requests. If each instance keeps its own local counter, a client can exceed the
+real global limit by hitting different instances.
+
+Bad design:
 
 ```mermaid
 flowchart LR
     C[Client] --> LB[Load Balancer]
-    LB --> A1[App Server 1: local counter]
-    LB --> A2[App Server 2: local counter]
-    LB --> A3[App Server 3: local counter]
+    LB --> A1[Server 1: local counter]
+    LB --> A2[Server 2: local counter]
+    LB --> A3[Server 3: local counter]
 ```
 
-For global limits, counters usually need shared storage.
-
-```mermaid
-flowchart LR
-    A1[App Server 1] --> R[(Redis)]
-    A2[App Server 2] --> R
-    A3[App Server 3] --> R
-```
-
-### Distributed System Design
-
-In a distributed system, the rate limiter is usually placed before the
-application servers, often inside an API gateway or a dedicated rate limiter
-service. All gateway instances use a shared fast store, such as Redis, so the
-limit is enforced globally instead of per machine.
+Better design: all rate limiter instances use shared state.
 
 ```mermaid
 flowchart TD
-    U1[User / Client]
-    U2[Mobile App]
+    U1[Web Client]
+    U2[Mobile Client]
     U3[Partner API Client]
 
     CDN[CDN / Edge Protection]
     LB[Load Balancer]
 
     subgraph GatewayLayer[API Gateway Layer]
-        G1[Gateway Instance 1]
-        G2[Gateway Instance 2]
-        G3[Gateway Instance 3]
+        G1[Gateway 1]
+        G2[Gateway 2]
+        G3[Gateway 3]
     end
 
-    subgraph RateLimiter[Rate Limiter Logic]
-        K[Build Limit Key]
-        P[Load Limit Policy]
-        D{Allow Request?}
+    subgraph Decision[Rate Limit Decision]
+        K[Build Key]
+        P[Load Policy]
+        C{Within Limit?}
     end
 
-    subgraph SharedState[Shared Distributed State]
-        Redis[(Redis Cluster\nCounters / Tokens)]
-        Rules[(Rule Store\nPlans / Limits / Routes)]
+    subgraph SharedState[Shared State]
+        R[(Redis Cluster)]
+        Rules[(Rules / Plans Store)]
     end
 
-    subgraph AppLayer[Application Layer]
-        A1[App Server 1]
-        A2[App Server 2]
-        A3[App Server 3]
+    subgraph Services[Backend Services]
+        S1[User Service]
+        S2[Order Service]
+        S3[Payment Service]
     end
 
-    Obs[Metrics / Logs / Alerts]
+    M[Metrics / Logs / Alerts]
     Reject[429 Too Many Requests]
 
     U1 --> CDN
@@ -355,89 +244,308 @@ flowchart TD
 
     K --> P
     P --> Rules
-    P --> D
-    D -->|Atomic increment / token update| Redis
-    Redis --> D
+    P --> C
+    C -->|Atomic counter/token update| R
+    R --> C
 
-    D -->|Allowed| A1
-    D -->|Allowed| A2
-    D -->|Allowed| A3
-    D -->|Rejected| Reject
+    C -->|Allowed| S1
+    C -->|Allowed| S2
+    C -->|Allowed| S3
+    C -->|Rejected| Reject
 
-    D --> Obs
-    Reject --> Obs
-    A1 --> Obs
-    A2 --> Obs
-    A3 --> Obs
+    C --> M
+    Reject --> M
+    S1 --> M
+    S2 --> M
+    S3 --> M
 ```
 
-Typical request flow:
+Request flow:
 
-1. Client sends a request.
-2. CDN or edge layer blocks obvious abusive traffic.
-3. Load balancer sends the request to an API gateway instance.
-4. Gateway builds a limit key such as `user_id + route`.
-5. Gateway loads the matching rate limit rule.
-6. Gateway updates Redis atomically to check the current counter or token count.
-7. If allowed, the request goes to the application.
-8. If rejected, the gateway returns `429 Too Many Requests`.
-9. Metrics and logs record the decision for debugging and alerting.
+1. Client sends request.
+2. CDN or edge blocks simple abusive traffic when possible.
+3. Load balancer forwards request to an API gateway instance.
+4. Gateway identifies the caller and route.
+5. Gateway builds a key such as `api_key + route`.
+6. Gateway loads the matching policy, such as `100 requests/minute`.
+7. Gateway updates shared state atomically.
+8. If the request is within the limit, it goes to the backend.
+9. If the request exceeds the limit, gateway returns `429`.
+10. Metrics and logs record the decision.
 
-Common shared stores:
+## 8. Storage Design
 
-- Redis.
-- Memcached.
-- DynamoDB or other key-value stores.
-- Purpose-built gateway or service mesh rate limiters.
+For distributed rate limiting, the shared store must support fast atomic updates.
 
-Important distributed concerns:
+Common choices:
 
-- Atomic counter updates.
-- Expiration for old windows.
-- Clock skew between servers.
-- Hot keys for very popular users or tenants.
-- Store availability and latency.
-- Fail-open vs fail-closed behavior.
+| Store | Use When | Notes |
+| --- | --- | --- |
+| Redis | Low-latency counters or token state | Common choice because of atomic operations and TTL |
+| Memcached | Simple distributed counters | Less flexible than Redis |
+| DynamoDB or key-value DB | Very large scale with durable state | Higher latency than Redis |
+| Gateway built-in storage | Managed API gateway limits | Less custom logic |
 
-## Fail-Open vs Fail-Closed
+For a fixed-window limiter, Redis state may look like:
 
-If the rate limiter's shared store is unavailable, the system must decide what
-to do.
+```text
+rate_limit:{api_key}:{route}:{window_start} -> count
+TTL -> window size
+```
+
+The update must be atomic. For example, increment the counter and set expiry as
+one logical operation. If two requests arrive at the same time, both must not
+read the same old value and incorrectly pass.
+
+Important storage concerns:
+
+- Use TTL so old keys disappear automatically.
+- Avoid very hot keys when one tenant or route has huge traffic.
+- Keep the rate limiter store highly available.
+- Keep the operation small because it happens on every request.
+- Consider local caching for rules, not for global counters.
+
+## 9. Failure Handling
+
+The rate limiter itself can fail. The shared store can become slow or
+unavailable, and the system must choose a policy.
 
 | Mode | Meaning | Tradeoff |
 | --- | --- | --- |
-| Fail-open | Allow requests when limiter is unavailable | Better availability, weaker protection |
-| Fail-closed | Reject requests when limiter is unavailable | Strong protection, worse availability |
+| Fail-open | Allow requests when limiter cannot decide | Better availability, weaker protection |
+| Fail-closed | Reject requests when limiter cannot decide | Stronger protection, worse availability |
 
-Public user-facing systems often fail-open for availability. Security-sensitive
-or expensive endpoints may fail-closed.
+For normal user-facing APIs, fail-open is often chosen to avoid taking the whole
+product down because the limiter is unavailable. For login abuse prevention,
+payments, expensive endpoints, or strict partner quotas, fail-closed may be more
+appropriate.
+
+Other failure concerns:
+
+- Redis latency can add latency to every request.
+- Clock differences can affect time-window calculations.
+- A retry storm can increase rejected and allowed traffic.
+- Bad configuration can accidentally block real users.
+- A single global key can become a bottleneck.
+
+## 10. Algorithms
+
+Now that the system shape is clear, choose the algorithm.
+
+### Fixed Window
+
+Fixed Window allows a fixed number of requests in a fixed time period.
+
+Example:
+
+```text
+Limit: 100 requests per minute
+Window: 12:00:00 to 12:00:59
+```
+
+The counter resets when the next minute starts.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant RL as Rate Limiter
+    participant App
+
+    Client->>RL: Request 1
+    RL->>App: Allow
+    Client->>RL: Request 2
+    RL->>App: Allow
+    Client->>RL: Request 100
+    RL->>App: Allow
+    Client->>RL: Request 101
+    RL-->>Client: 429 Too Many Requests
+```
+
+Pros:
+
+- Simple to understand.
+- Easy to implement.
+- Low memory usage.
+- Works well for basic limits.
+
+Cons:
+
+- Boundary bursts are possible.
+
+Boundary burst:
+
+```text
+100 requests at 12:00:59
+100 requests at 12:01:00
+```
+
+That is technically valid, but it allows 200 requests in a very short interval.
+
+### Sliding Window Log
+
+Sliding Window Log stores timestamps of recent requests for each key.
+
+For every request:
+
+1. Remove timestamps older than the window.
+2. Count the remaining timestamps.
+3. Allow only if count is below the limit.
+4. Store the new timestamp if allowed.
+
+Pros:
+
+- Very accurate.
+- Avoids fixed-window boundary bursts.
+
+Cons:
+
+- Higher memory usage.
+- More expensive when many users send many requests.
+
+Use it when strict accuracy matters and traffic volume is manageable.
+
+### Sliding Window Counter
+
+Sliding Window Counter approximates sliding behavior using the previous and
+current fixed windows.
+
+It estimates how much traffic from the previous window still overlaps with the
+current rolling window.
+
+Pros:
+
+- More accurate than fixed window.
+- Lower memory than sliding window log.
+- Good balance for large-scale systems.
+
+Cons:
+
+- Approximate, not exact.
+- More complex than fixed window.
+
+Use it when you need better fairness than fixed window but cannot store every
+request timestamp.
+
+### Token Bucket
+
+Token Bucket has a bucket with a maximum capacity. Tokens refill over time. Each
+request consumes one token.
+
+```mermaid
+flowchart TD
+    R[Refill Tokens] --> B[Token Bucket]
+    Q[Request] --> C{Token Available?}
+    B --> C
+    C -->|Yes| A[Allow Request]
+    C -->|No| D[Reject or Wait]
+```
+
+Example:
+
+```text
+Refill rate: 10 tokens/second
+Bucket size: 50 tokens
+```
+
+This allows a short burst of up to 50 requests, but long-term traffic is limited
+to about 10 requests per second.
+
+Pros:
+
+- Allows controlled bursts.
+- Good for public APIs and user actions.
+- Smooths sustained usage without being too strict.
+
+Cons:
+
+- Needs careful refill math.
+- Slightly more complex state than fixed window.
+
+### Leaky Bucket
+
+Leaky Bucket accepts requests into a queue and processes them at a fixed rate.
+If the queue is full, new requests are rejected.
+
+```mermaid
+flowchart TD
+    I[Incoming Requests] --> Q[Queue]
+    Q -->|Fixed Output Rate| S[Service]
+    Q -. Full .-> R[Reject]
+```
+
+Pros:
+
+- Smooths traffic to a steady output rate.
+- Useful when downstream systems cannot handle bursts.
+
+Cons:
+
+- Can add queueing latency.
+- Queue management is required.
+- Requests may wait before being processed.
+
+Use it when a downstream service needs a steady flow, not bursty traffic.
+
+## Algorithm Comparison
+
+| Algorithm | Accuracy | Burst Support | Memory | Main Tradeoff |
+| --- | --- | --- | --- | --- |
+| Fixed Window | Low near boundaries | Allows boundary bursts | Low | Simplest, but less fair |
+| Sliding Window Log | High | Controls bursts well | High | Accurate, but expensive |
+| Sliding Window Counter | Medium-high | Controls bursts reasonably | Low | Scalable approximation |
+| Token Bucket | Medium | Allows controlled bursts | Low | Great for burst-friendly APIs |
+| Leaky Bucket | Medium | Smooths bursts into steady flow | Queue size | Adds latency but protects downstream |
+
+## When To Use Which Algorithm
+
+| Use Case | Good Choice | Why |
+| --- | --- | --- |
+| Simple endpoint protection | Fixed Window | Easy to implement and reason about |
+| Public API with normal short bursts | Token Bucket | Lets clients burst briefly while enforcing long-term rate |
+| Strict fairness for low/medium traffic | Sliding Window Log | Most accurate rolling-window behavior |
+| Large-scale API gateway limits | Sliding Window Counter | Better fairness than fixed window with low memory |
+| Protecting a fragile downstream service | Leaky Bucket | Sends traffic at a steady rate |
+| Login or password reset protection | Sliding Window Log or Sliding Window Counter | Reduces abuse over a rolling time window |
+| Costly third-party API calls | Token Bucket or Leaky Bucket | Controls spend and shields dependency |
+
+## Real Examples
+
+These examples describe common real-world usage patterns, not claims about a
+specific company's internal implementation.
+
+| Scenario | Common Algorithm Fit | Reason |
+| --- | --- | --- |
+| API product with developer keys | Token Bucket | Developers may send small bursts, but sustained usage must stay within plan limits |
+| Login endpoint | Sliding Window Log or Counter | Brute-force attempts should be limited over a rolling period |
+| SMS or email sending | Token Bucket | Allows normal short activity bursts while controlling abuse and cost |
+| Payment creation endpoint | Fixed Window or Sliding Window Counter | Protects expensive and sensitive operations |
+| Background jobs calling a downstream API | Leaky Bucket | Prevents sudden bursts from overwhelming the dependency |
+| Free vs paid SaaS plans | Token Bucket with per-plan bucket sizes | Paid plans can have larger capacity and refill rates |
 
 ## Rate Limiting vs Throttling vs Quotas
-
-These terms are related but not identical.
 
 | Concept | Meaning |
 | --- | --- |
 | Rate limiting | Reject or delay requests above a short-term limit |
 | Throttling | Slow down requests instead of immediately rejecting |
-| Quota | Long-term allowance, such as 1 million requests per month |
+| Quota | Long-term allowance, such as requests per day or month |
 
 An API platform may use all three:
 
 - 100 requests per second rate limit.
-- Slower processing after 80% usage.
+- Slower processing after high usage.
 - 1 million requests per month quota.
 
 ## Metrics To Watch
 
-Important rate limiter metrics:
+Important metrics:
 
 - Allowed request count.
 - Rejected request count.
 - Rejection rate by route, user, IP, API key, or tenant.
-- Current counter or token usage.
-- Shared store latency.
-- Shared store errors.
+- Latency added by the rate limiter.
+- Redis or shared-store latency.
+- Redis or shared-store errors.
 - Hot keys.
 - `429` response rate.
 - Retry-after distribution.
@@ -446,9 +554,9 @@ Important logs:
 
 - Limit key.
 - Request path and method.
-- Limit rule that matched.
+- Matched rule.
 - Allowed or rejected decision.
-- Remaining tokens or count.
+- Remaining tokens or counter value.
 - Trace/request ID.
 
 ## Java Example
@@ -471,58 +579,34 @@ javac src/java/rate-limiter/SimpleFixedWindowRateLimiter.java
 java -cp src/java/rate-limiter SimpleFixedWindowRateLimiter
 ```
 
-## Design Checklist
-
-When designing a system with rate limiting, ask:
-
-- What are we protecting: app servers, databases, third-party APIs, or users?
-- Where should the limiter run: edge, gateway, app, or internal service?
-- What is the limit key: IP, user, API key, tenant, route, or a combination?
-- What algorithm fits the traffic shape?
-- Should bursts be allowed?
-- Should excess requests be rejected or delayed?
-- What status code and headers should clients receive?
-- Do limits need to be global across many servers?
-- What shared store is needed for distributed counters?
-- Should the system fail-open or fail-closed?
-- What metrics and logs are needed for debugging?
-
 ## Example Interview Answer
 
-If asked "How would you add rate limiting to this system?", a strong answer
-could be:
+If asked "Design a rate limiter", a strong answer could be:
 
-> I would add rate limiting at the API gateway so limits are enforced before
-> requests reach the application. For authenticated APIs, I would key limits by
-> user ID or API key, and for anonymous traffic I would start with IP-based
-> limits. A token bucket works well for public APIs because it allows short
-> bursts while controlling sustained traffic. If the application runs on many
-> servers, I would store counters or tokens in Redis using atomic operations and
-> expirations. Exceeded requests should return `429 Too Many Requests` with
-> `Retry-After` and rate-limit headers. I would monitor allowed requests,
-> rejected requests, Redis latency, and hot keys.
-
-## Quick Summary
-
-Use a rate limiter to protect services from too much traffic from one client,
-user, tenant, API key, or route.
-
-Fixed Window is simple but can allow boundary bursts. Token Bucket allows
-controlled bursts. Leaky Bucket smooths traffic. Sliding Window Log is accurate
-but uses more memory. Sliding Window Counter balances accuracy and efficiency.
-
-Distributed rate limiting usually needs shared storage such as Redis so limits
-are enforced globally across servers.
+> I would first clarify what we are limiting: IP, user ID, API key, tenant, or
+> endpoint. For a public API, I would put the limiter at the API gateway so
+> traffic is checked before reaching application servers. The gateway would
+> build a key such as `api_key + route`, load the matching plan or route policy,
+> and update shared state in Redis using an atomic operation. If the request is
+> allowed, it goes to the backend. If not, the gateway returns `429 Too Many
+> Requests` with `Retry-After` and rate-limit headers. For the algorithm, I
+> would choose Token Bucket if short bursts are acceptable, Sliding Window
+> Counter if fairness over a rolling window matters at scale, or Sliding Window
+> Log if strict accuracy is required for lower-volume sensitive endpoints. I
+> would monitor allowed requests, rejected requests, Redis latency, hot keys, and
+> 429 rates.
 
 ## Things To Remember
 
-- Rate limiters protect availability, fairness, and cost.
-- Pick the right key: IP, user, API key, tenant, route, or combination.
-- Fixed Window is the easiest algorithm to start with.
-- Token Bucket is common for APIs because it handles bursts well.
-- Sliding Window algorithms reduce fixed-window boundary problems.
-- Distributed limits need atomic shared counters.
-- Use `429 Too Many Requests` for rejected HTTP requests.
-- Include `Retry-After` when clients should wait before retrying.
-- Decide whether the limiter should fail-open or fail-closed.
-- Watch rejected request rate, hot keys, and shared store latency.
+- Start with requirements before algorithms.
+- Decide the limit key carefully.
+- API gateway is a common place for distributed API rate limiting.
+- Distributed limits need shared state or a managed gateway/service.
+- Shared counter updates must be atomic.
+- Fixed Window is simple but has boundary bursts.
+- Token Bucket is good when controlled bursts are acceptable.
+- Sliding Window Log is accurate but uses more memory.
+- Sliding Window Counter is a scalable compromise.
+- Leaky Bucket is useful when the output rate must be steady.
+- Rejected HTTP requests usually return `429 Too Many Requests`.
+- Always monitor rejection rate, store latency, and hot keys.
